@@ -315,10 +315,8 @@ def format_gemini_prompt(matches: list[MatchRequest]) -> str:
     
     for i, m in enumerate(matches):
         # ID|Home|Away
-        # Solo pasamos nombres limpios para que Gemini use su conocimiento
         t1_clean = m.team1.strip()
         t2_clean = m.team2.strip()
-        
         line = f"{i}|{t1_clean}|{t2_clean}"
         matches_data_lines.append(line)
         
@@ -330,26 +328,34 @@ Format: ID|Home|Away.
 
 Stage: FIFA World Cup 2026.
 
-Task: Predict realistic final scores for these matches.
-IMPORTANT: Rely ENTIRELY on your internal knowledge of real-world football regarding team strengths, current squad quality, and historical performance (e.g. Brazil, Argentina, France are strong).
+Task: Predict realistic final scores.
+IMPORTANT: Rely ENTIRELY on your internal knowledge of real-world football regarding team strengths, current squad quality, and historical performance.
 Draws are allowed (we handle penalties separately).
 
 Output Format: ID|HomeScore|AwayScore
+STRICT INSTRUCTION: Output ONLY the requested format. NO markdown. NO extra text. One line per match.
+
+Example Output:
+0|2|1
+1|1|1
+2|0|3
 
 Matches to predict:
 
 {matches_data_str}"""
     return prompt
-    return prompt
-    return prompt
-    return prompt
 
 def parse_gemini_response(text: str, original_matches: list[MatchRequest]):
     """
     Parsea la respuesta de texto de Gemini en formato ID|Score1|Score2
+    Si falta algún ID, usa el modelo local como fallback para ese partido específico.
     """
     results = []
-    lines = text.strip().split("\n")
+    
+    # 1. Limpieza de Markdown (ej: ```csv ... ```)
+    clean_text = text.replace("```csv", "").replace("```", "").strip()
+    
+    lines = clean_text.split("\n")
     
     # Mapa por ID para reordenar si es necesario
     predictions_map = {}
@@ -367,6 +373,7 @@ def parse_gemini_response(text: str, original_matches: list[MatchRequest]):
                 
     # Reconstruir respuesta
     for i, m in enumerate(original_matches):
+        # Escenario A: Gemini dio una predicción válida
         if i in predictions_map:
             score1, score2 = predictions_map[i]
             
@@ -396,11 +403,33 @@ def parse_gemini_response(text: str, original_matches: list[MatchRequest]):
             if m.is_knockout:
                 item["qualified_team"] = qualified
             results.append(item)
+            
+        # Escenario B: Gemini falló / olvidó este ID -> Fallback a Local
         else:
-             results.append({
-                "match": f"{m.team1} vs {m.team2}",
-                "error": "No prediction from Gemini"
-            })
+            print(f"Gemini omitió el match ID {i} ({m.team1} vs {m.team2}). Usando Fallback Local.")
+            try:
+                # Llamamos a la lógica local
+                res = _predict_single_match_local(m.team1, m.team2, m.is_knockout)
+                
+                item = {
+                    "match": f"{m.team1} vs {m.team2}",
+                    "team1_score": res["score1"],
+                    "team2_score": res["score2"],
+                    "details": {
+                        "winner": res["winner_label"],
+                        "source": "Local Model (Fallback per item)"
+                    }
+                }
+                if m.is_knockout:
+                    item["qualified_team"] = res["qualified"]
+                
+                results.append(item)
+            except Exception as e:
+                # Si falla incluso el local, devolvemos error (muy raro)
+                results.append({
+                    "match": f"{m.team1} vs {m.team2}",
+                    "error": f"Error total (Gemini + Local): {str(e)}"
+                })
             
     return results
 
