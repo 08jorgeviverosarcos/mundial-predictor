@@ -390,40 +390,102 @@ def parse_gemini_response(text: str, original_matches: list[MatchRequest]):
 
 @app.post("/predict-gemini")
 def predict_gemini(request: MatchRequest):
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=503, detail="Gemini API Key no configurada.")
-        
+    # Intentar con Gemini
+    if GEMINI_API_KEY:
+        try:
+            model_gemini = genai.GenerativeModel("gemini-2.5-flash")
+            prompt = format_gemini_prompt([request])
+            
+            response = model_gemini.generate_content(prompt)
+            parsed_results = parse_gemini_response(response.text, [request])
+            
+            if parsed_results and "error" not in parsed_results[0]:
+                 return parsed_results[0]
+        except Exception as e:
+            print(f"Error Gemini (single): {e}")
+            # Fallback a local
+            pass
+            
+    # Fallback: Modelo Local
+    if model is None or encoder is None:
+        raise HTTPException(status_code=503, detail="El modelo local no está disponible y Gemini falló.")
+
     try:
-        model_gemini = genai.GenerativeModel("gemini-2.5-flash")
-        prompt = format_gemini_prompt([request])
+        res = _predict_single_match_local(request.team1, request.team2, request.is_knockout)
         
-        response = model_gemini.generate_content(prompt)
-        parsed_results = parse_gemini_response(response.text, [request])
-        
-        if not parsed_results:
-             raise HTTPException(status_code=500, detail="Error parseando respuesta de Gemini")
-             
-        return parsed_results[0]
-        
+        response = {
+            "match": f"{request.team1} vs {request.team2}",
+            "team1_score": res["score1"],
+            "team2_score": res["score2"],
+            "is_knockout": request.is_knockout,
+            "details": {
+                f"{request.team1}_goals_raw": round(res["pred_t1_raw"], 2),
+                f"{request.team2}_goals_raw": round(res["pred_t2_raw"], 2),
+                "winner": res["winner_label"],
+                "source": "Local Model"
+            },
+        }
+
+        if request.is_knockout:
+            response["qualified_team"] = res["qualified"]
+
+        return response
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error en predicción local (Fallback): {str(e)}")
 
 @app.post("/predict-batch-gemini")
 def predict_batch_gemini(request: BatchMatchRequest):
-    if not GEMINI_API_KEY:
-        raise HTTPException(status_code=503, detail="Gemini API Key no configurada.")
-        
-    try:
-        model_gemini = genai.GenerativeModel("gemini-2.5-flash")
-        prompt = format_gemini_prompt(request.matches)
-        
-        response = model_gemini.generate_content(prompt)
-        parsed_results = parse_gemini_response(response.text, request.matches)
-        
-        return {
-            "total_matches": len(parsed_results),
-            "results": parsed_results
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Intentar con Gemini
+    if GEMINI_API_KEY:
+        try:
+            model_gemini = genai.GenerativeModel("gemini-2.5-flash")
+            prompt = format_gemini_prompt(request.matches)
+            
+            response = model_gemini.generate_content(prompt)
+            parsed_results = parse_gemini_response(response.text, request.matches)
+            
+            # Verificar si parseó correctamente todos
+            # Si hay muchos errores, igual devolvemos lo que hay, pero si falla por completo la API entra al except
+            return {
+                "total_matches": len(parsed_results),
+                "results": parsed_results
+            }
+            
+        except Exception as e:
+            print(f"Error Gemini (batch): {e}")
+            # Fallback a local
+            pass
+
+    # Fallback: Modelo Local (Batch)
+    if model is None or encoder is None:
+        raise HTTPException(status_code=503, detail="El modelo local no está disponible y Gemini falló.")
+
+    results = []
+    for match in request.matches:
+        try:
+            res = _predict_single_match_local(match.team1, match.team2, match.is_knockout)
+            item = {
+                "match": f"{match.team1} vs {match.team2}",
+                "team1_score": res["score1"],
+                "team2_score": res["score2"],
+                "details": {
+                    f"{match.team1}_goals_raw": round(res["pred_t1_raw"], 2),
+                    f"{match.team2}_goals_raw": round(res["pred_t2_raw"], 2),
+                    "winner": res["winner_label"],
+                    "source": "Local Model"
+                },
+            }
+            if match.is_knockout:
+                item["qualified_team"] = res["qualified"]
+            results.append(item)
+        except Exception:
+            results.append({
+                "match": f"{match.team1} vs {match.team2}",
+                "error": "Error en modelo local (Fallback)",
+                "details": {"source": "Local Model (Failed)"}
+            })
+
+    return {
+        "total_matches": len(results),
+        "results": results
+    }
