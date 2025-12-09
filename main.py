@@ -5,6 +5,7 @@ import pandas as pd
 import joblib
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 
@@ -13,6 +14,21 @@ load_dotenv()
 app = FastAPI(
     title="Mundial Predictor",
     description="API para predecir resultados exactos de fútbol"
+)
+
+# Configuración de CORS
+origins = [
+    "https://mundial2026.app",
+    "http://localhost:3000", # Para desarrollo frontend local
+    "http://127.0.0.1:3000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 MODEL_PATH = "football_model.joblib"
