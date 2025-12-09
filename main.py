@@ -348,7 +348,6 @@ Matches to predict:
 def parse_gemini_response(text: str, original_matches: list[MatchRequest]):
     """
     Parsea la respuesta de texto de Gemini en formato ID|Score1|Score2
-    Si falta algún ID, usa el modelo local como fallback para ese partido específico.
     """
     results = []
     
@@ -438,7 +437,7 @@ def predict_gemini(request: MatchRequest):
     # Intentar con Gemini
     if GEMINI_API_KEY:
         try:
-            model_gemini = genai.GenerativeModel("gemini-2.5-flash")
+            model_gemini = genai.GenerativeModel("gemini-2.5-flash-lite")
             prompt = format_gemini_prompt([request])
             
             response = model_gemini.generate_content(prompt)
@@ -483,7 +482,7 @@ def predict_batch_gemini(request: BatchMatchRequest):
     # Intentar con Gemini
     if GEMINI_API_KEY:
         try:
-            model_gemini = genai.GenerativeModel("gemini-2.5-flash")
+            model_gemini = genai.GenerativeModel("gemini-2.5-flash-lite")
             prompt = format_gemini_prompt(request.matches)
             
             response = model_gemini.generate_content(prompt)
