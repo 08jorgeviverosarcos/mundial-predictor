@@ -4,4 +4,5 @@ pandas
 scikit-learn
 joblib
 numpy
-
+google-generativeai
+python-dotenv

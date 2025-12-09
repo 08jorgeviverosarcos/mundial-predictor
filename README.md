@@ -1,17 +1,22 @@
 # Mundial Predictor
 
-Este proyecto predice resultados de partidos de fútbol utilizando un modelo de **RandomForestRegressor** entrenado con datos históricos.
+Este proyecto predice resultados de partidos de fútbol utilizando un modelo de **RandomForestRegressor** entrenado con datos históricos, y también ofrece integración con **Google Gemini** para predicciones generativas.
 
-El modelo tiene las siguientes características:
-1.  **Predicción de Goles Exactos**: Predice cuántos goles anotará cada equipo.
-2.  **Sin sesgo de localía**: Trata los partidos de forma simétrica (Equipo A vs Equipo B).
-3.  **Ponderación Temporal**: Da mucho más peso a partidos recientes que a los antiguos.
-4.  **Manejo de Eliminatorias**: Si es un partido eliminatorio y termina en empate, simula una definición por penales (aleatorio).
+## Características
+
+1.  **Modelo Local (Random Forest)**:
+    *   Predicción de Goles Exactos.
+    *   Sin sesgo de localía (Simétrico).
+    *   Ponderación Temporal (Mayor peso a partidos recientes).
+2.  **Modelo Generativo (Gemini)**:
+    *   Usa el LLM de Google para simular resultados basados en estadísticas ("Ratings").
+    *   Soporta predicción por lotes.
+3.  **Manejo de Eliminatorias**: Simulación de penales en caso de empate en fases eliminatorias.
 
 ## Estructura
 
 -   `matches.csv`: Dataset histórico.
--   `train_model.py`: Script de entrenamiento. Genera `football_model.joblib` y `team_encoder.joblib`.
+-   `train_model.py`: Script de entrenamiento (Local).
 -   `main.py`: API en FastAPI.
 -   `requirements.txt`: Dependencias.
 
@@ -21,9 +26,16 @@ El modelo tiene las siguientes características:
 pip install -r requirements.txt
 ```
 
-## Entrenamiento
+## Configuración
 
-Para generar el modelo:
+Para usar los endpoints de Gemini, necesitas una API Key.
+Crea un archivo `.env` basado en `env_example.txt`:
+
+```bash
+GEMINI_API_KEY=tu_api_key_real
+```
+
+## Entrenamiento (Modelo Local)
 
 ```bash
 python train_model.py
@@ -35,39 +47,24 @@ python train_model.py
 uvicorn main:app --reload
 ```
 
-## Uso de la API
+## Endpoints
 
-Endpoint: `POST /predict`
+### 1. Predicción Local
 
-**Ejemplo de Request (Partido Normal):**
+*   **POST** `/predict`
+*   **POST** `/predict-batch`
+
+### 2. Predicción con Gemini
+
+*   **POST** `/predict-gemini`
+*   **POST** `/predict-batch-gemini`
+
+**Ejemplo de Request (Batch):**
 ```json
 {
-  "team1": "Brazil",
-  "team2": "Argentina"
+  "matches": [
+    { "team1": "Brazil", "team2": "Argentina" },
+    { "team1": "France", "team2": "Germany", "is_knockout": true }
+  ]
 }
 ```
-
-**Ejemplo de Request (Eliminatoria):**
-```json
-{
-  "team1": "Croatia",
-  "team2": "Japan",
-  "is_knockout": true
-}
-```
-
-**Ejemplo de Respuesta:**
-```json
-{
-  "match": "Croatia vs Japan",
-  "predicted_score": "1 - 1",
-  "is_knockout": true,
-  "details": {
-    "Croatia_goals_raw": 1.1,
-    "Japan_goals_raw": 0.9,
-    "winner": "Empate (Croatia gana en penales)"
-  },
-  "qualified_team": "Croatia"
-}
-```
-

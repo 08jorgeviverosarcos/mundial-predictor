@@ -1,0 +1,4 @@
+.env
+football_model.joblib
+team_encoder.joblib
+football_model_meta.joblib
