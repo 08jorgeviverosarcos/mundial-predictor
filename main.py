@@ -310,38 +310,38 @@ def predict_batch(request: BatchMatchRequest):
 # === SERVICIOS CON GEMINI ===
 
 def format_gemini_prompt(matches: list[MatchRequest]) -> str:
-    # Preparar datos
+    # Preparar datos sin usar CSV ni stats calculados
     matches_data_lines = []
-    is_knockout_global = False # Asumimos que si hay uno knockout, el contexto es knockout o mixto
     
     for i, m in enumerate(matches):
-        if m.is_knockout:
-            is_knockout_global = True
+        # ID|Home|Away
+        # Solo pasamos nombres limpios para que Gemini use su conocimiento
+        t1_clean = m.team1.strip()
+        t2_clean = m.team2.strip()
         
-        # Obtener "Rat" (Rating) = team_avg_goals * 10 (aprox, para que se vea como 15, 20, etc)
-        # O simplemente usamos el avg goals crudo.
-        t1_avg, _ = get_team_features(m.team1)
-        t2_avg, _ = get_team_features(m.team2)
-        
-        # ID|Home|Rat|Away|Rat
-        # Usamos i como ID
-        line = f"{i}|{m.team1}|{t1_avg:.2f}|{m.team2}|{t2_avg:.2f}"
+        line = f"{i}|{t1_clean}|{t2_clean}"
         matches_data_lines.append(line)
         
     matches_data_str = "\n".join(matches_data_lines)
     
-    prompt = f"""FIFA 26 Bulk Sim.
+    prompt = f"""FIFA 26 Bulk Simulation.
 
-Format: ID|Home|Rat|Away|Rat.
+Format: ID|Home|Away.
 
-Stage: {'Knockout(No draws)' if is_knockout_global else 'Group(Draws ok)'}.
+Stage: FIFA World Cup 2026.
 
-Task: Predict scores based on Rat.
+Task: Predict realistic final scores for these matches.
+IMPORTANT: Rely ENTIRELY on your internal knowledge of real-world football regarding team strengths, current squad quality, and historical performance (e.g. Brazil, Argentina, France are strong).
+Draws are allowed (we handle penalties separately).
+
 Output Format: ID|HomeScore|AwayScore
 
-Data:
+Matches to predict:
 
 {matches_data_str}"""
+    return prompt
+    return prompt
+    return prompt
     return prompt
 
 def parse_gemini_response(text: str, original_matches: list[MatchRequest]):
