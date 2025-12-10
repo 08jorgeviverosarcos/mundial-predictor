@@ -1,171 +1,198 @@
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import LabelEncoder
+import xgboost as xgb
+from sklearn.metrics import mean_squared_error, r2_score
 import joblib
 
+# Definición de los países anfitriones del Mundial 2026
+HOSTS_2026 = ['United States', 'Mexico', 'Canada']
 
-def main():
-    # 1. Cargar datos
-    print("Cargando dataset...")
-    df = pd.read_csv("matches.csv")
+def train_fifa_model(file_path="matches_with_elo.csv"):
+    """
+    Carga el dataset con ELO, realiza la ingeniería de características
+    y entrena un modelo XGBoost para predecir los goles marcados.
+    """
+    print("🚀 Iniciando el proceso de entrenamiento del Modelo FIFA 2026 (XGBoost)...")
 
-    # 2. Preprocesamiento básico
-    print("Preprocesando datos...")
+    # 1. Cargar y Limpiar Datos
+    try:
+        df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        print(f"ERROR: Archivo no encontrado. Asegúrate de que '{file_path}' exista y contenga las columnas de ELO.")
+        return
 
-    required_cols = ["date", "home_team", "away_team", "home_score", "away_score"]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Falta la columna requerida en matches.csv: {col}")
+    # Limpieza esencial
+    df['date'] = pd.to_datetime(df['date'])
+    df = df.sort_values('date')
+    
+    # Asegurar la limpieza de los scores y convertir a entero (como discutimos)
+    df = df.dropna(subset=['home_score', 'away_score', 'elo_home', 'elo_away'])
+    df['home_score'] = df['home_score'].astype(int)
+    df['away_score'] = df['away_score'].astype(int)
+    
+    # Normalizar nombres de equipos a MAYÚSCULAS para consistencia
+    df['home_team'] = df['home_team'].astype(str).str.strip().str.upper()
+    df['away_team'] = df['away_team'].astype(str).str.strip().str.upper()
 
-    # Eliminar partidos sin resultado o sin fecha
-    df = df.dropna(subset=["home_score", "away_score", "date"])
-
-    # Normalizar tipos y nombres
-    df["date"] = pd.to_datetime(df["date"])
-    df["home_team"] = df["home_team"].astype(str).str.strip().str.upper()
-    df["away_team"] = df["away_team"].astype(str).str.strip().str.upper()
-
-    # 3. Dataset simétrico (cada partido -> 2 filas)
-    print("Construyendo dataset simétrico (team / opponent)...")
-
+    print(f"Datos cargados. Total de partidos válidos: {len(df)}")
+    
+    # 2. Ingeniería de Características (Dataset Simétrico + Evitar Data Leakage)
+    print("⚙️ Ingeniería de Features: Creando dataset simétrico...")
+    
+    # =========================================================================
+    # PERSPECTIVA HOME (Equipo A)
+    # =========================================================================
     df1 = pd.DataFrame({
         "date": df["date"],
         "team": df["home_team"],
         "opponent": df["away_team"],
-        "goals": df["home_score"],
+        "goals": df["home_score"],        # TARGET: Goles que marcamos (Home)
+        "opp_goals": df["away_score"],    # Goles que recibimos (Away)
+        "elo": df["elo_home"],            # Nuestro ELO
+        "opp_elo": df["elo_away"],        # ELO del rival
+        
+        # is_host: Si el partido no es neutral, el equipo en 'home' tiene ventaja (1)
+        # Esto enseña al modelo el "costo" de la localía histórica.
+        "is_host": np.where(df['neutral'] == False, 1, 0) 
     })
 
+    # =========================================================================
+    # PERSPECTIVA AWAY (Equipo B)
+    # =========================================================================
     df2 = pd.DataFrame({
         "date": df["date"],
         "team": df["away_team"],
         "opponent": df["home_team"],
-        "goals": df["away_score"],
+        "goals": df["away_score"],        # TARGET: Goles que marcamos (Away)
+        "opp_goals": df["home_score"],    # Goles que recibimos (Home)
+        "elo": df["elo_away"],
+        "opp_elo": df["elo_home"],
+        
+        # is_host: El equipo en 'away' nunca tiene la ventaja de localía histórica (0)
+        "is_host": 0 
     })
 
-    full_df = pd.concat([df1, df2], ignore_index=True)
+    full_df = pd.concat([df1, df2], ignore_index=True).sort_values('date')
 
-    # Seguridad: quitar filas raras
-    full_df = full_df.dropna(subset=["team", "opponent", "goals", "date"])
+    # Feature 1: ELO Diferencial (El más importante)
+    full_df['elo_diff'] = full_df['elo'] - full_df['opp_elo']
+    
+    # Feature 2: Promedios Rodantes (Rolling Averages) - La forma reciente
+    # Esto asegura que el modelo sepa cómo jugamos en los últimos 10 partidos, sin data leakage.
+    def get_rolling_stats(group):
+        # Promedio de goles marcados en los últimos 10 partidos (shift() es clave)
+        group['rolling_goals_scored'] = group['goals'].shift().rolling(window=10, min_periods=1).mean()
+        # Promedio de goles recibidos en los últimos 10 partidos
+        group['rolling_goals_conceded'] = group['opp_goals'].shift().rolling(window=10, min_periods=1).mean()
+        return group
 
-    # 4. Estadísticas históricas por equipo (fuerza ofensiva)
-    print("Calculando estadísticas históricas de equipos (ataque)...")
-
-    team_stats = (
-        full_df
-        .groupby("team")["goals"]
-        .agg(["mean", "count"])
-        .reset_index()
-    )
-    team_stats.columns = ["team", "team_avg_goals", "team_matches"]
-
-    # Merge stats para team
-    full_df = full_df.merge(team_stats, on="team", how="left")
-
-    # Stats para opponent
-    opp_stats = team_stats.copy()
-    opp_stats.columns = ["opponent", "opp_avg_goals", "opp_matches"]
-    full_df = full_df.merge(opp_stats, on="opponent", how="left")
-
-    # Medias globales por si falta algo
-    global_avg_goals = full_df["goals"].mean()
-    global_matches_median = full_df[["team_matches", "opp_matches"]].median().median()
-
-    # Rellenar NA de forma segura (sin inplace encadenado)
-    full_df["team_avg_goals"] = full_df["team_avg_goals"].fillna(global_avg_goals)
-    full_df["opp_avg_goals"] = full_df["opp_avg_goals"].fillna(global_avg_goals)
-    full_df["team_matches"] = full_df["team_matches"].fillna(global_matches_median)
-    full_df["opp_matches"] = full_df["opp_matches"].fillna(global_matches_median)
-
-    # Limitar matches para evitar valores ridículos
-    full_df["team_matches"] = full_df["team_matches"].clip(0, 300)
-    full_df["opp_matches"] = full_df["opp_matches"].clip(0, 300)
-
-    # 5. Codificar equipos
-    print("Codificando equipos (LabelEncoder)...")
-
-    le = LabelEncoder()
-    all_teams = pd.concat([full_df["team"], full_df["opponent"]]).unique()
-    le.fit(all_teams)
-
-    full_df["team_code"] = le.transform(full_df["team"])
-    full_df["opponent_code"] = le.transform(full_df["opponent"])
-
-    # 6. Ponderación por recencia
-    print("Calculando pesos por recencia...")
+    full_df = full_df.groupby('team', group_keys=False).apply(get_rolling_stats)
+    
+    # Rellenar valores iniciales (los primeros 10 partidos de la historia) con el promedio global
+    global_avg_goals = full_df['goals'].mean()
+    full_df[['rolling_goals_scored', 'rolling_goals_conceded']] = full_df[['rolling_goals_scored', 'rolling_goals_conceded']].fillna(global_avg_goals)
+    
+    # 3. Ponderación por Recencia (Time Decay)
+    print("⏳ Aplicando pesos por recencia...")
     max_date = full_df["date"].max()
     full_df["days_diff"] = (max_date - full_df["date"]).dt.days
-
-    # Decaimiento más suave: la historia cuenta, pero los últimos años pesan más
-    alpha = 0.0004  # puedes tunearlo si quieres
+    alpha = 0.0003  # Se puede tunear. Un valor más bajo mantiene más peso a lo viejo.
     full_df["weight"] = np.exp(-alpha * full_df["days_diff"])
-
-    # Por seguridad, si alguien quedó con NaN en weight, lo rellenamos
-    full_df["weight"] = full_df["weight"].fillna(full_df["weight"].mean())
-
-    # 7. Features y target
-    print("Preparando features y target...")
-
+    
+    # 4. Definición de Features y Target
+    
+    # Las features clave que aprendió el modelo:
     feature_cols = [
-        "team_code",
-        "opponent_code",
-        "team_avg_goals",
-        "opp_avg_goals",
-        "team_matches",
-        "opp_matches",
+        "elo",                 # Mi ELO
+        "opp_elo",             # ELO del rival
+        "elo_diff",            # La diferencia (¡Vital!)
+        "is_host",             # Histórica ventaja de localía (para entrenamiento)
+        "rolling_goals_scored",
+        "rolling_goals_conceded" # Defensa del rival (indirectamente)
     ]
 
     X = full_df[feature_cols].astype(float)
     y = full_df["goals"].astype(float)
     sample_weights = full_df["weight"].astype(float)
+    
+    # 5. Backtesting Riguroso (Validación Temporal)
+    print("🛡️ Realizando Backtesting (Entrenar pasado, Probar futuro)...")
+    
+    # Entrenar con todo hasta antes del Mundial de Qatar 2022
+    split_date = '2022-11-01' 
+    
+    train = full_df[full_df['date'] < split_date]
+    test = full_df[full_df['date'] >= split_date]
 
-    # Debug rápido por si acaso
-    print("Shape X:", X.shape)
-    print("Algún NaN en X?:", X.isna().any().any())
-    print("Algún NaN en y?:", np.isnan(y).any())
-    print("Algún NaN en weights?:", np.isnan(sample_weights).any())
+    X_train = train[feature_cols]
+    y_train = train["goals"]
+    X_test = test[feature_cols]
+    y_test = test["goals"]
+    train_weights = train["weight"]
+    
+    # 6. Entrenamiento del Modelo XGBoost (Regresión de Conteo Poisson)
+    print("🧠 Entrenando XGBoost Regressor (Optimizado para Conteo de Goles)...")
 
-    # 8. Entrenar modelo
-    print("Entrenando modelo de regresión (RandomForestRegressor)...")
-
-    model = RandomForestRegressor(
-        n_estimators=300,
-        max_depth=12,
-        random_state=42,
+    model = xgb.XGBRegressor(
+        n_estimators=1000,
+        learning_rate=0.01,
+        max_depth=5,
+        objective='count:poisson',
         n_jobs=-1,
+        random_state=42,
+        early_stopping_rounds=50,  # Definir Early Stopping aquí
+        eval_metric='rmse'         # Métrica a monitorear
     )
 
-    model.fit(X, y, sample_weight=sample_weights)
+    model.fit(
+        X_train, y_train, 
+        sample_weight=train_weights,
+        eval_set=[(X_test, y_test)], 
+        verbose=100
+    )
 
-    # 9. Guardar modelo + encoder + meta
-    print("Guardando modelo y encoder...")
+    # 7. Evaluación del Backtesting
+    y_pred_test = model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred_test))
+    r2 = r2_score(y_test, y_pred_test)
+    
+    print("\n===================================")
+    print(f"✅ Backtesting completado (Datos 2022-Actualidad):")
+    print(f"Error Raíz Cuadrada Media (RMSE): {rmse:.4f} (Menor es mejor)")
+    print(f"Coeficiente de Determinación (R2): {r2:.4f}")
+    print("===================================")
+    
+    # 8. Guardar Modelo y Metadatos
+    
+    # Guardamos el modelo entrenado con TODOS los datos (Train + Test) para que sea lo más actual posible
+    # NOTA: Usamos best_iteration + 1 porque best_iteration es 0-indexed
+    best_n = model.best_iteration + 1 if hasattr(model, 'best_iteration') else 1000
+    
+    final_model = xgb.XGBRegressor(
+        n_estimators=best_n,
+        learning_rate=0.01,
+        max_depth=5,
+        objective='count:poisson',
+        n_jobs=-1,
+        random_state=42
+    )
+    final_model.fit(X, y, sample_weight=sample_weights) # Re-entrenar con TODO el set
 
-    joblib.dump(model, "football_model.joblib")
-    joblib.dump(le, "team_encoder.joblib")
-
+    joblib.dump(final_model, "fifa_2026_model.joblib")
+    print("💾 Modelo final guardado como 'fifa_2026_model.joblib'")
+    
+    # Guardar metadatos cruciales para la predicción
     meta = {
         "feature_cols": feature_cols,
-        "train_max_date": max_date,
+        "hosts": HOSTS_2026,
         "global_avg_goals": float(global_avg_goals),
+        "last_elos": full_df.drop_duplicates(subset=['team'], keep='last')[['team', 'elo']]
     }
-    joblib.dump(meta, "football_model_meta.joblib")
-
-    print("¡Entrenamiento completado!")
-    print("n_features_in_ del modelo:", getattr(model, "n_features_in_", None))
-
-    # 10. Importancia de features (solo para info, puede ser NaN si la suma es 0)
-    try:
-        print("\nImportancia de las features:")
-        fi = model.feature_importances_
-        for name, imp in sorted(
-            zip(feature_cols, fi),
-            key=lambda x: x[1],
-            reverse=True,
-        ):
-            print(f"- {name}: {imp}")
-    except Exception as e:
-        print("No se pudo calcular feature_importances_:", e)
+    joblib.dump(meta, "fifa_2026_meta.joblib")
+    print("💾 Metadatos guardados (incluye anfitriones y último ELO).")
+    
+    print("\n🎉 Entrenamiento Finalizado. Tu modelo está listo para predecir el fixture 2026.")
 
 
 if __name__ == "__main__":
-    main()
+    train_fifa_model()

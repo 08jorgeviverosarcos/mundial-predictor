@@ -3,6 +3,7 @@ import random
 import numpy as np
 import pandas as pd
 import joblib
+import xgboost as xgb
 import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,41 +14,36 @@ load_dotenv()
 
 app = FastAPI(
     title="Mundial Predictor",
-    description="API para predecir resultados exactos de fútbol"
+    description="API para predecir resultados exactos de fútbol (XGBoost + Gemini)"
 )
 
 # Configuración de CORS
 origins = [
     "https://mundial2026.app",
-    "http://localhost:3000", # Para desarrollo frontend local
+    "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # ABIERTO SOLO PARA TEST
-    allow_credentials=False,  # importante si usas "*"
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-MODEL_PATH = "football_model.joblib"
-ENCODER_PATH = "team_encoder.joblib"
-MATCHES_PATH = "matches.csv"  # usamos el mismo dataset para calcular stats
+# Nuevas rutas de artefactos
+MODEL_PATH = "fifa_2026_model.joblib"
+META_PATH = "fifa_2026_meta.joblib"
 
 # Configuración de Gemini
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-else:
-    print("ADVERTENCIA: GEMINI_API_KEY no encontrada en variables de entorno.")
 
 model = None
-encoder = None
-team_stats_map = {}
-global_avg_goals = 1.0
-global_matches_median = 10.0
-
+meta_data = None
+last_elos = {}
 
 class MatchRequest(BaseModel):
     team1: str
@@ -57,170 +53,98 @@ class MatchRequest(BaseModel):
 class BatchMatchRequest(BaseModel):
     matches: list[MatchRequest]
 
-
-def load_team_stats():
-    """
-    Calcula estadísticas básicas por equipo a partir de matches.csv
-    para replicar la lógica de entrenamiento:
-    - team_avg_goals
-    - team_matches
-    """
-    global team_stats_map, global_avg_goals, global_matches_median
-
-    if not os.path.exists(MATCHES_PATH):
-        print(f"ADVERTENCIA: No se encontró {MATCHES_PATH}. "
-              f"Se usarán valores por defecto para las estadísticas de equipos.")
-        team_stats_map = {}
-        global_avg_goals = 1.0
-        global_matches_median = 10.0
-        return
-
-    print("Cargando matches.csv para calcular estadísticas de equipos...")
-    df = pd.read_csv(MATCHES_PATH)
-
-    required_cols = ["date", "home_team", "away_team", "home_score", "away_score"]
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Falta la columna requerida en matches.csv: {col}")
-
-    df = df.dropna(subset=["home_score", "away_score"])
-
-    df["home_team"] = df["home_team"].astype(str).str.strip().str.upper()
-    df["away_team"] = df["away_team"].astype(str).str.strip().str.upper()
-
-    # Dataset simétrico
-    df1 = pd.DataFrame({
-        "team": df["home_team"],
-        "goals": df["home_score"],
-    })
-    df2 = pd.DataFrame({
-        "team": df["away_team"],
-        "goals": df["away_score"],
-    })
-    full_df = pd.concat([df1, df2], ignore_index=True)
-
-    # Promedios y cantidad de partidos por equipo
-    stats = (
-        full_df
-        .groupby("team")["goals"]
-        .agg(["mean", "count"])
-        .reset_index()
-    )
-    stats.columns = ["team", "team_avg_goals", "team_matches"]
-
-    global_avg_goals = full_df["goals"].mean()
-    global_matches_median = stats["team_matches"].median()
-
-    # Guardamos en un dict para acceso rápido en predicción
-    team_stats_map = {}
-    for _, row in stats.iterrows():
-        team_name = row["team"]
-        team_stats_map[team_name] = {
-            "team_avg_goals": float(row["team_avg_goals"]),
-            "team_matches": float(row["team_matches"]),
-        }
-
-    print("Estadísticas de equipos cargadas correctamente.")
-
-
-def get_team_features(team_name: str):
-    """
-    Devuelve (avg_goals, matches) para un equipo.
-    Si no existe en el mapa, usa valores globales.
-    """
-    team_name = team_name.upper().strip()
-    stats = team_stats_map.get(team_name)
-
-    if stats is None:
-        return global_avg_goals, global_matches_median
-
-    # Clampeamos los matches para evitar valores extremos
-    matches = max(0.0, min(stats["team_matches"], 300.0))
-    return stats["team_avg_goals"], matches
-
-
-def goals_to_int(x: float) -> int:
-    """
-    Convierte goles esperados (float) a un entero razonable.
-    Evita que todo sea empate 1-1.
-    """
-    if x < 0.4:
-        return 0
-    elif x < 1.4:
-        return 1
-    elif x < 2.4:
-        return 2
-    elif x < 3.4:
-        return 3
-    else:
-        # Muy raro >3.4, pero lo dejamos en 4 por si acaso
-        return 4
-
 @app.on_event("startup")
 def load_artifacts():
-    global model, encoder
-
-    # Cargar modelo y encoder
-    if os.path.exists(MODEL_PATH) and os.path.exists(ENCODER_PATH):
+    global model, meta_data, last_elos
+    
+    if os.path.exists(MODEL_PATH) and os.path.exists(META_PATH):
         model = joblib.load(MODEL_PATH)
-        encoder = joblib.load(ENCODER_PATH)
-        print("Modelo de regresión y encoder cargados correctamente.")
+        meta_data = joblib.load(META_PATH)
+        
+        # Cargar ELOs en un dict rápido
+        # meta_data["last_elos"] es un DataFrame
+        elo_df = meta_data["last_elos"]
+        last_elos = dict(zip(elo_df["team"], elo_df["elo"]))
+        
+        print(f"✅ Modelo XGBoost y Metadatos cargados. {len(last_elos)} equipos con ELO.")
     else:
-        print("ADVERTENCIA: No se encontraron los archivos del modelo "
-              "(football_model.joblib / team_encoder.joblib).")
+        print(f"⚠️ ADVERTENCIA: No se encontraron {MODEL_PATH} o {META_PATH}. El modelo local fallará.")
 
-    # Cargar estadísticas de equipos desde matches.csv
-    load_team_stats()
+def get_team_elo(team_name: str):
+    """Obtiene el último ELO conocido o usa un promedio global por defecto (1500)"""
+    norm_name = team_name.strip().upper()
+    return last_elos.get(norm_name, 1500.0)
 
-
-@app.get("/")
-def read_root():
-    return {
-        "message": "Bienvenido al Mundial Predictor API. Usa /predict para predecir el marcador."
-    }
-
+def goals_to_int(x: float) -> int:
+    """Convierte predicción Poisson (float) a entero."""
+    if x < 0.5: return 0
+    elif x < 1.5: return 1
+    elif x < 2.5: return 2
+    elif x < 3.5: return 3
+    else: return 4
 
 def _predict_single_match_local(team1_name: str, team2_name: str, is_knockout: bool):
-    """Lógica interna para predecir con el modelo local"""
-    global model, encoder
+    global model, meta_data
     
+    if not model:
+        raise HTTPException(status_code=503, detail="Modelo no cargado")
+
     t1_norm = team1_name.strip().upper()
     t2_norm = team2_name.strip().upper()
-
-    # Validar equipos
-    known_teams = set(encoder.classes_)
-    if t1_norm not in known_teams:
-        raise HTTPException(status_code=400, detail=f"Equipo desconocido: {team1_name}")
-    if t2_norm not in known_teams:
-        raise HTTPException(status_code=400, detail=f"Equipo desconocido: {team2_name}")
-
-    t1_code = encoder.transform([t1_norm])[0]
-    t2_code = encoder.transform([t2_norm])[0]
-
-    # Stats ofensivas e historial (de nuestro mapa)
-    t1_avg_goals, t1_matches = get_team_features(t1_norm)
-    t2_avg_goals, t2_matches = get_team_features(t2_norm)
-
-    # Goles esperados Team 1 vs Team 2
-    x1 = np.array([[t1_code, t2_code, t1_avg_goals, t2_avg_goals, t1_matches, t2_matches]])
-    pred_t1 = float(model.predict(x1)[0])
-
-    # Goles esperados Team 2 vs Team 1
-    x2 = np.array([[t2_code, t1_code, t2_avg_goals, t1_avg_goals, t2_matches, t1_matches]])
-    pred_t2 = float(model.predict(x2)[0])
-
-    # Convertir a marcador entero
+    
+    # 1. Obtener Features
+    elo1 = get_team_elo(t1_norm)
+    elo2 = get_team_elo(t2_norm)
+    
+    # ¿Quién es local?
+    # En el modelo, "is_host" era 1 si el equipo jugaba en casa Y no era campo neutral.
+    # Para el Mundial 2026, los hosts son USA, Mexico, Canada.
+    hosts = [h.upper() for h in meta_data.get("hosts", [])]
+    
+    is_host1 = 1 if t1_norm in hosts else 0
+    is_host2 = 1 if t2_norm in hosts else 0
+    
+    # Valores por defecto para rolling stats (usamos el promedio global del entrenamiento)
+    # En producción idealmente tendrías un servicio de stats en vivo, pero aquí usamos el promedio histórico
+    # para no penalizar injustamente a nadie.
+    avg_goals_global = meta_data.get("global_avg_goals", 1.3)
+    
+    # Features esperadas por el modelo:
+    # ["elo", "opp_elo", "elo_diff", "is_host", "rolling_goals_scored", "rolling_goals_conceded"]
+    
+    # Perspectiva Team 1
+    features_t1 = pd.DataFrame([{
+        "elo": elo1,
+        "opp_elo": elo2,
+        "elo_diff": elo1 - elo2,
+        "is_host": is_host1,
+        "rolling_goals_scored": avg_goals_global,   # Asumimos forma promedio
+        "rolling_goals_conceded": avg_goals_global  # Asumimos defensa promedio
+    }])
+    
+    # Perspectiva Team 2
+    features_t2 = pd.DataFrame([{
+        "elo": elo2,
+        "opp_elo": elo1,
+        "elo_diff": elo2 - elo1,
+        "is_host": is_host2,
+        "rolling_goals_scored": avg_goals_global,
+        "rolling_goals_conceded": avg_goals_global
+    }])
+    
+    # Predicción
+    pred_t1 = float(model.predict(features_t1)[0])
+    pred_t2 = float(model.predict(features_t2)[0])
+    
     score1 = goals_to_int(pred_t1)
     score2 = goals_to_int(pred_t2)
-
-    # Determinar ganador
+    
     winner_label = "Empate"
     if score1 > score2:
         winner_label = team1_name
     elif score2 > score1:
         winner_label = team2_name
-
-    # Lógica knockout
+        
     qualified = None
     if is_knockout:
         if winner_label == "Empate":
@@ -228,7 +152,7 @@ def _predict_single_match_local(team1_name: str, team2_name: str, is_knockout: b
             winner_label = f"Empate ({qualified} gana en penales)"
         else:
             qualified = winner_label
-
+            
     return {
         "score1": score1,
         "score2": score2,
@@ -238,125 +162,37 @@ def _predict_single_match_local(team1_name: str, team2_name: str, is_knockout: b
         "qualified": qualified
     }
 
+@app.get("/")
+def read_root():
+    return {"message": "Mundial Predictor API v2 (XGBoost ELO + Gemini)"}
 
-@app.post("/predict")
-def predict_score(request: MatchRequest):
-    global model, encoder
-    if model is None or encoder is None:
-        raise HTTPException(status_code=503, detail="El modelo no está disponible.")
-
-    result = _predict_single_match_local(request.team1, request.team2, request.is_knockout)
-    
-    response = {
-        "match": f"{request.team1} vs {request.team2}",
-        "team1_score": result["score1"],
-        "team2_score": result["score2"],
-        "is_knockout": request.is_knockout,
-        "details": {
-            f"{request.team1}_goals_raw": round(result["pred_t1_raw"], 2),
-            f"{request.team2}_goals_raw": round(result["pred_t2_raw"], 2),
-            "winner": result["winner_label"],
-        },
-    }
-
-    if request.is_knockout:
-        response["qualified_team"] = result["qualified"]
-
-    return response
-
-
-@app.post("/predict-batch")
-def predict_batch(request: BatchMatchRequest):
-    global model, encoder
-
-    if model is None or encoder is None:
-        raise HTTPException(status_code=503, detail="El modelo no está disponible.")
-
-    results = []
-    
-    # Podríamos optimizar usando el _predict_single_match_local o hacerlo en batch real
-    # Por consistencia y manejo de errores, iteramos:
-    
-    for match in request.matches:
-        try:
-            res = _predict_single_match_local(match.team1, match.team2, match.is_knockout)
-            item = {
-                "match": f"{match.team1} vs {match.team2}",
-                "team1_score": res["score1"],
-                "team2_score": res["score2"],
-                "details": {
-                    f"{match.team1}_goals_raw": round(res["pred_t1_raw"], 2),
-                    f"{match.team2}_goals_raw": round(res["pred_t2_raw"], 2),
-                    "winner": res["winner_label"],
-                },
-            }
-            if match.is_knockout:
-                item["qualified_team"] = res["qualified"]
-            results.append(item)
-        except HTTPException:
-            # Si falla un equipo (no existe), lo agregamos como error o saltamos
-            # Aquí pondremos valores nulos para indicar fallo
-            results.append({
-                "match": f"{match.team1} vs {match.team2}",
-                "error": "Equipo desconocido"
-            })
-
-    return {
-        "total_matches": len(results),
-        "results": results
-    }
-
-
-# === SERVICIOS CON GEMINI ===
+# === PROMPTS GEMINI (Igual que antes) ===
 
 def format_gemini_prompt(matches: list[MatchRequest]) -> str:
-    # Preparar datos sin usar CSV ni stats calculados
     matches_data_lines = []
-    
     for i, m in enumerate(matches):
-        # ID|Home|Away
         t1_clean = m.team1.strip()
         t2_clean = m.team2.strip()
-        line = f"{i}|{t1_clean}|{t2_clean}"
-        matches_data_lines.append(line)
-        
+        matches_data_lines.append(f"{i}|{t1_clean}|{t2_clean}")
     matches_data_str = "\n".join(matches_data_lines)
     
-    prompt = f"""FIFA 26 Bulk Simulation.
-
+    return f"""FIFA 26 Bulk Simulation.
 Format: ID|Home|Away.
-
 Stage: FIFA World Cup 2026.
-
 Task: Predict realistic final scores.
-IMPORTANT: Rely ENTIRELY on your internal knowledge of real-world football regarding team strengths, current squad quality, and historical performance.
-Draws are allowed (we handle penalties separately).
-
+IMPORTANT: Rely ENTIRELY on your internal knowledge of real-world football.
 Output Format: ID|HomeScore|AwayScore
-STRICT INSTRUCTION: Output ONLY the requested format. NO markdown. NO extra text. One line per match.
-
-Example Output:
+STRICT INSTRUCTION: Output ONLY the requested format. NO markdown. One line per match.
+Example:
 0|2|1
 1|1|1
-2|0|3
-
 Matches to predict:
-
 {matches_data_str}"""
-    return prompt
 
 def parse_gemini_response(text: str, original_matches: list[MatchRequest]):
-    """
-    Parsea la respuesta de texto de Gemini en formato ID|Score1|Score2
-    """
     results = []
-    
-    # 1. Limpieza de Markdown (ej: ```csv ... ```)
     clean_text = text.replace("```csv", "").replace("```", "").strip()
-    
     lines = clean_text.split("\n")
-    
-    # Mapa por ID para reordenar si es necesario
     predictions_map = {}
     
     for line in lines:
@@ -370,18 +206,13 @@ def parse_gemini_response(text: str, original_matches: list[MatchRequest]):
             except ValueError:
                 continue
                 
-    # Reconstruir respuesta
     for i, m in enumerate(original_matches):
-        # Escenario A: Gemini dio una predicción válida
         if i in predictions_map:
             score1, score2 = predictions_map[i]
-            
             winner_label = "Empate"
-            if score1 > score2:
-                winner_label = m.team1
-            elif score2 > score1:
-                winner_label = m.team2
-                
+            if score1 > score2: winner_label = m.team1
+            elif score2 > score1: winner_label = m.team2
+            
             qualified = None
             if m.is_knockout:
                 if winner_label == "Empate":
@@ -394,69 +225,33 @@ def parse_gemini_response(text: str, original_matches: list[MatchRequest]):
                 "match": f"{m.team1} vs {m.team2}",
                 "team1_score": score1,
                 "team2_score": score2,
-                "details": {
-                    "winner": winner_label,
-                    "source": "Gemini"
-                }
+                "details": {"winner": winner_label, "source": "Gemini"}
             }
-            if m.is_knockout:
-                item["qualified_team"] = qualified
+            if m.is_knockout: item["qualified_team"] = qualified
             results.append(item)
-            
-        # Escenario B: Gemini falló / olvidó este ID -> Fallback a Local
         else:
-            print(f"Gemini omitió el match ID {i} ({m.team1} vs {m.team2}). Usando Fallback Local.")
+            # FALLBACK A LOCAL POR ITEM
             try:
-                # Llamamos a la lógica local
                 res = _predict_single_match_local(m.team1, m.team2, m.is_knockout)
-                
                 item = {
                     "match": f"{m.team1} vs {m.team2}",
                     "team1_score": res["score1"],
                     "team2_score": res["score2"],
-                    "details": {
-                        "winner": res["winner_label"],
-                        "source": "Local Model (Fallback per item)"
-                    }
+                    "details": {"winner": res["winner_label"], "source": "Local Model (Fallback)"}
                 }
-                if m.is_knockout:
-                    item["qualified_team"] = res["qualified"]
-                
+                if m.is_knockout: item["qualified_team"] = res["qualified"]
                 results.append(item)
             except Exception as e:
-                # Si falla incluso el local, devolvemos error (muy raro)
-                results.append({
-                    "match": f"{m.team1} vs {m.team2}",
-                    "error": f"Error total (Gemini + Local): {str(e)}"
-                })
-            
+                results.append({"match": f"{m.team1} vs {m.team2}", "error": str(e)})
+                
     return results
 
-@app.post("/predict-gemini")
-def predict_gemini(request: MatchRequest):
-    # Intentar con Gemini
-    if GEMINI_API_KEY:
-        try:
-            model_gemini = genai.GenerativeModel("gemini-2.5-flash-lite")
-            prompt = format_gemini_prompt([request])
-            
-            response = model_gemini.generate_content(prompt)
-            parsed_results = parse_gemini_response(response.text, [request])
-            
-            if parsed_results and "error" not in parsed_results[0]:
-                 return parsed_results[0]
-        except Exception as e:
-            print(f"Error Gemini (single): {e}")
-            # Fallback a local
-            pass
-            
-    # Fallback: Modelo Local
-    if model is None or encoder is None:
-        raise HTTPException(status_code=503, detail="El modelo local no está disponible y Gemini falló.")
+# === ENDPOINTS ===
 
+@app.post("/predict")
+def predict_score(request: MatchRequest):
     try:
         res = _predict_single_match_local(request.team1, request.team2, request.is_knockout)
-        
         response = {
             "match": f"{request.team1} vs {request.team2}",
             "team1_score": res["score1"],
@@ -466,70 +261,65 @@ def predict_gemini(request: MatchRequest):
                 f"{request.team1}_goals_raw": round(res["pred_t1_raw"], 2),
                 f"{request.team2}_goals_raw": round(res["pred_t2_raw"], 2),
                 "winner": res["winner_label"],
-                "source": "Local Model"
+                "source": "Local XGBoost"
             },
         }
-
         if request.is_knockout:
             response["qualified_team"] = res["qualified"]
-
         return response
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error en predicción local (Fallback): {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/predict-gemini")
+def predict_gemini(request: MatchRequest):
+    if GEMINI_API_KEY:
+        try:
+            model_gemini = genai.GenerativeModel("gemini-2.5-flash-lite")
+            prompt = format_gemini_prompt([request])
+            response = model_gemini.generate_content(prompt)
+            parsed = parse_gemini_response(response.text, [request])
+            if parsed and "error" not in parsed[0]:
+                return parsed[0]
+        except Exception as e:
+            print(f"Gemini error: {e}")
+            pass
+            
+    # Fallback directo a endpoint local logic
+    return predict_score(request)
+
+@app.post("/predict-batch")
+def predict_batch(request: BatchMatchRequest):
+    results = []
+    for m in request.matches:
+        try:
+            res = _predict_single_match_local(m.team1, m.team2, m.is_knockout)
+            item = {
+                "match": f"{m.team1} vs {m.team2}",
+                "team1_score": res["score1"],
+                "team2_score": res["score2"],
+                "details": {
+                    "winner": res["winner_label"],
+                    "source": "Local XGBoost"
+                }
+            }
+            if m.is_knockout: item["qualified_team"] = res["qualified"]
+            results.append(item)
+        except Exception as e:
+            results.append({"match": f"{m.team1} vs {m.team2}", "error": str(e)})
+    return {"total_matches": len(results), "results": results}
 
 @app.post("/predict-batch-gemini")
 def predict_batch_gemini(request: BatchMatchRequest):
-    # Intentar con Gemini
     if GEMINI_API_KEY:
         try:
             model_gemini = genai.GenerativeModel("gemini-2.5-flash-lite")
             prompt = format_gemini_prompt(request.matches)
-            
             response = model_gemini.generate_content(prompt)
-            parsed_results = parse_gemini_response(response.text, request.matches)
-            
-            # Verificar si parseó correctamente todos
-            # Si hay muchos errores, igual devolvemos lo que hay, pero si falla por completo la API entra al except
-            return {
-                "total_matches": len(parsed_results),
-                "results": parsed_results
-            }
-            
+            parsed = parse_gemini_response(response.text, request.matches)
+            return {"total_matches": len(parsed), "results": parsed}
         except Exception as e:
-            print(f"Error Gemini (batch): {e}")
-            # Fallback a local
+            print(f"Gemini batch error: {e}")
             pass
-
-    # Fallback: Modelo Local (Batch)
-    if model is None or encoder is None:
-        raise HTTPException(status_code=503, detail="El modelo local no está disponible y Gemini falló.")
-
-    results = []
-    for match in request.matches:
-        try:
-            res = _predict_single_match_local(match.team1, match.team2, match.is_knockout)
-            item = {
-                "match": f"{match.team1} vs {match.team2}",
-                "team1_score": res["score1"],
-                "team2_score": res["score2"],
-                "details": {
-                    f"{match.team1}_goals_raw": round(res["pred_t1_raw"], 2),
-                    f"{match.team2}_goals_raw": round(res["pred_t2_raw"], 2),
-                    "winner": res["winner_label"],
-                    "source": "Local Model"
-                },
-            }
-            if match.is_knockout:
-                item["qualified_team"] = res["qualified"]
-            results.append(item)
-        except Exception:
-            results.append({
-                "match": f"{match.team1} vs {match.team2}",
-                "error": "Error en modelo local (Fallback)",
-                "details": {"source": "Local Model (Failed)"}
-            })
-
-    return {
-        "total_matches": len(results),
-        "results": results
-    }
+            
+    # Fallback a batch local
+    return predict_batch(request)
