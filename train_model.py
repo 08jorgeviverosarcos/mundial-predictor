@@ -79,14 +79,15 @@ def train_fifa_model(file_path="matches_with_elo.csv"):
     
     # Feature 2: Promedios Rodantes (Rolling Averages) - La forma reciente
     # Esto asegura que el modelo sepa cómo jugamos en los últimos 10 partidos, sin data leakage.
-    def get_rolling_stats(group):
-        # Promedio de goles marcados en los últimos 10 partidos (shift() es clave)
-        group['rolling_goals_scored'] = group['goals'].shift().rolling(window=10, min_periods=1).mean()
-        # Promedio de goles recibidos en los últimos 10 partidos
-        group['rolling_goals_conceded'] = group['opp_goals'].shift().rolling(window=10, min_periods=1).mean()
-        return group
-
-    full_df = full_df.groupby('team', group_keys=False).apply(get_rolling_stats)
+    # Usamos transform para evitar perder columnas como 'team'
+    
+    full_df['rolling_goals_scored'] = full_df.groupby('team')['goals'].transform(
+        lambda x: x.shift().rolling(window=10, min_periods=1).mean()
+    )
+    
+    full_df['rolling_goals_conceded'] = full_df.groupby('team')['opp_goals'].transform(
+        lambda x: x.shift().rolling(window=10, min_periods=1).mean()
+    )
     
     # Rellenar valores iniciales (los primeros 10 partidos de la historia) con el promedio global
     global_avg_goals = full_df['goals'].mean()
@@ -182,11 +183,16 @@ def train_fifa_model(file_path="matches_with_elo.csv"):
     print("💾 Modelo final guardado como 'fifa_2026_model.joblib'")
     
     # Guardar metadatos cruciales para la predicción
+    # Aseguramos que 'team' es una columna y no está en el index por si acaso
+    last_elos_df = full_df.copy()
+    if 'team' not in last_elos_df.columns and 'team' in last_elos_df.index.names:
+        last_elos_df = last_elos_df.reset_index()
+        
     meta = {
         "feature_cols": feature_cols,
         "hosts": HOSTS_2026,
         "global_avg_goals": float(global_avg_goals),
-        "last_elos": full_df.drop_duplicates(subset=['team'], keep='last')[['team', 'elo']]
+        "last_elos": last_elos_df.drop_duplicates(subset=['team'], keep='last')[['team', 'elo']]
     }
     joblib.dump(meta, "fifa_2026_meta.joblib")
     print("💾 Metadatos guardados (incluye anfitriones y último ELO).")
